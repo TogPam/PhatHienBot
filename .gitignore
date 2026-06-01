@@ -1,0 +1,23 @@
+# --- Cấu hình môi trường ---
+.env
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+
+# --- Dữ liệu nhạy cảm (QUAN TRỌNG) ---
+*.secret
+*.token
+*.tok
+mastodon_usercred.secret
+mastodon_clientcred.secret
+
+
+# --- Các file tạo bởi hệ thống/OS ---
+.DS_Store
+Thumbs.db
+
+# --- Logs và Báo cáo ---
+*.log
+docs/*.png
