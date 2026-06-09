@@ -11,313 +11,298 @@ from sklearn.ensemble import IsolationForest
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.decomposition import PCA
 
-# Configure page layout and style
 st.set_page_config(page_title="Social Bot Detector Dashboard", page_icon="🛡️", layout="wide", initial_sidebar_state="expanded")
 
-# Load and process unscaled data from JSON
+# ─── DATA LOADING ────────────────────────────────────────────────────────────
 @st.cache_data
 def get_processed_raw_data(json_path):
     if not os.path.exists(json_path):
         return None
     with open(json_path, 'r', encoding='utf-8') as f:
         raw_users = json.load(f)
-        
-    processed_features = []
-    
+
+    records = []
     for user in raw_users:
-        user_id = user['id']
-        username = user['username']
-        is_bot_declared = 1 if user['bot'] else 0
-        
-        followers = user['followers_count']
-        following = user['following_count']
+        followers  = user['followers_count']
+        following  = user['following_count']
         follow_ratio = following / (followers + 1)
-        
         posts = user['posts']
-        total_posts_retrieved = len(posts)
-        
+        n = len(posts)
         avg_time_diff_minutes = 1440.0
         engagement_rate = 0.0
         night_post_ratio = 0.0
         lexical_diversity = 1.0
-        
-        if total_posts_retrieved > 0:
-            timestamps = []
-            total_engagements = 0
-            night_posts_count = 0
-            all_words = []
-            
+
+        if n > 0:
+            timestamps, engagements, night_count, all_words = [], 0, 0, []
             for post in posts:
                 content = post.get('content', '')
                 dt = pd.to_datetime(post['created_at']).tz_localize(None)
                 timestamps.append(dt)
-                total_engagements += (post['favourites_count'] + post['reblogs_count'] + post['replies_count'])
+                engagements += post['favourites_count'] + post['reblogs_count'] + post['replies_count']
                 if 1 <= dt.hour <= 5:
-                    night_posts_count += 1
-                words = re.findall(r'\w+', content.lower())
-                all_words.extend(words)
-            
-            if total_posts_retrieved > 1:
+                    night_count += 1
+                all_words.extend(re.findall(r'\w+', content.lower()))
+            if n > 1:
                 timestamps.sort()
-                time_diffs = [ (timestamps[i] - timestamps[i-1]).total_seconds() / 60.0 for i in range(1, len(timestamps)) ]
-                avg_time_diff_minutes = np.mean(time_diffs)
-            
-            engagement_rate = total_engagements / total_posts_retrieved
-            night_post_ratio = night_posts_count / total_posts_retrieved
-            if len(all_words) > 0:
+                diffs = [(timestamps[i] - timestamps[i-1]).total_seconds() / 60.0 for i in range(1, n)]
+                avg_time_diff_minutes = float(np.mean(diffs))
+            engagement_rate = engagements / n
+            night_post_ratio = night_count / n
+            if all_words:
                 lexical_diversity = len(set(all_words)) / len(all_words)
- 
-        processed_features.append({
-            'user_id': user_id,
-            'username': username,
-            'is_bot_declared': is_bot_declared,
+
+        records.append({
+            'user_id': user['id'],
+            'username': user['username'],
+            'is_bot_declared': 1 if user['bot'] else 0,
             'follow_ratio': follow_ratio,
             'avg_time_diff_minutes': avg_time_diff_minutes,
             'engagement_rate': engagement_rate,
             'night_post_ratio': night_post_ratio,
-            'lexical_diversity': lexical_diversity
+            'lexical_diversity': lexical_diversity,
         })
-        
-    return pd.DataFrame(processed_features)
+    return pd.DataFrame(records)
 
-# Define file paths dynamically
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JSON_PATH = os.path.join(BASE_DIR, 'data', 'mastodon_dataset.json')
-
 df_raw = get_processed_raw_data(JSON_PATH)
 
 if df_raw is None:
     st.error("⚠️ Không tìm thấy file `data/mastodon_dataset.json`. Vui lòng chạy crawler trước!")
     st.stop()
 
-# --- SIDEBAR INTERACTIVE HYPERPARAMETER TUNING ---
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2721/2721272.png", width=80)
     st.title("🛡️ Bot Detector Controls")
     st.markdown("Cấu hình trực tiếp các thuật toán Machine Learning.")
     st.markdown("---")
-    
     st.header("⚙️ K-Means")
-    n_clusters = st.slider("Số lượng cụm (n_clusters)", min_value=2, max_value=10, value=3, step=1)
-    
+    n_clusters = st.slider("Số lượng cụm (n_clusters)", 2, 10, 3)
     st.header("⚙️ DBSCAN")
-    eps = st.slider("Bán kính lân cận (eps)", min_value=0.1, max_value=2.5, value=0.8, step=0.1)
-    min_samples = st.slider("Mẫu tối thiểu (min_samples)", min_value=1, max_value=10, value=2, step=1)
-    
+    eps = st.slider("Bán kính lân cận (eps)", 0.1, 2.5, 0.8, 0.1)
+    min_samples = st.slider("Mẫu tối thiểu (min_samples)", 1, 10, 2)
     st.header("⚙️ Isolation Forest")
-    contamination = st.slider("Tỷ lệ dị biệt (contamination)", min_value=0.01, max_value=0.30, value=0.10, step=0.01)
+    contamination = st.slider("Tỷ lệ dị biệt (contamination)", 0.01, 0.30, 0.10, 0.01)
 
-# --- RUN DYNAMIC ML MODELS ---
-features = ['follow_ratio', 'avg_time_diff_minutes', 'engagement_rate', 'night_post_ratio', 'lexical_diversity']
-X_raw = df_raw[features].values
+# ─── HYBRID DETECTION ENGINE ─────────────────────────────────────────────────
+df = df_raw.copy()
+FEATURES = ['follow_ratio', 'avg_time_diff_minutes', 'engagement_rate', 'night_post_ratio', 'lexical_diversity']
 
-# Scale features on the fly
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_raw)
+df['hybrid_cluster']  = 0
+df['detection_source'] = ''
+df['outlier_reason']   = ''
 
-# 1. KMeans
-kmeans = KMeans(n_clusters=n_clusters, init='k-means++', random_state=42)
-kmeans_labels = kmeans.fit_predict(X_scaled)
-df_raw['kmeans_cluster'] = kmeans_labels
+# ── Layer 1: Rule-Based Heuristics (raw feature values, no scaling needed) ──
+rule_mask = pd.Series(False, index=df.index)
 
-# 2. DBSCAN
-dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-dbscan_labels = dbscan.fit_predict(X_scaled)
-df_raw['dbscan_cluster'] = dbscan_labels
-dbscan_outliers = np.sum(dbscan_labels == -1)
+m1 = df['is_bot_declared'] == 1
+df.loc[m1, 'outlier_reason'] += 'API Declared Bot | '
+rule_mask |= m1
 
-# 3. Isolation Forest
-iso = IsolationForest(contamination=contamination, random_state=42)
-iso_labels = iso.fit_predict(X_scaled)
-df_raw['iso_outlier'] = iso_labels
-iso_outliers = np.sum(iso_labels == -1)
+m2 = df['username'].str.contains('bot', case=False, na=False)
+df.loc[m2, 'outlier_reason'] += 'Bot in Username | '
+rule_mask |= m2
 
-# Calculate PCA dynamically for scatter plot
-pca = PCA(n_components=2)
-pca_features = pca.fit_transform(X_scaled)
-df_raw['pca_1'] = pca_features[:, 0]
-df_raw['pca_2'] = pca_features[:, 1]
-df_raw['is_bot'] = df_raw['dbscan_cluster'].apply(lambda x: 'Bot/Anomaly' if x == -1 else 'Normal User')
+m3 = df['lexical_diversity'] < 0.1
+df.loc[m3, 'outlier_reason'] += 'Extreme Repetitive Content | '
+rule_mask |= m3
 
-# Calculate performance metrics
-# KMeans
-kmeans_sil = f"{silhouette_score(X_scaled, kmeans_labels):.4f}"
-kmeans_db = f"{davies_bouldin_score(X_scaled, kmeans_labels):.4f}"
+m4 = df['avg_time_diff_minutes'] < 0.5
+df.loc[m4, 'outlier_reason'] += 'Inhuman Posting Speed | '
+rule_mask |= m4
 
-# DBSCAN
-unique_db = set(dbscan_labels)
-if len(unique_db - {-1}) >= 1 and len(unique_db) > 1:
-    dbscan_sil = f"{silhouette_score(X_scaled, dbscan_labels):.4f}"
-    dbscan_db = f"{davies_bouldin_score(X_scaled, dbscan_labels):.4f}"
-else:
-    dbscan_sil = "N/A"
-    dbscan_db = "N/A"
+df.loc[rule_mask, 'hybrid_cluster']   = -1
+df.loc[rule_mask, 'detection_source'] = 'rule'
 
-# Isolation Forest
-unique_iso = set(iso_labels)
-if len(unique_iso) > 1:
-    iso_sil = f"{silhouette_score(X_scaled, iso_labels):.4f}"
-    iso_db = f"{davies_bouldin_score(X_scaled, iso_labels):.4f}"
-else:
-    iso_sil = "N/A"
-    iso_db = "N/A"
+# ── Layer 2: ML Models on clean subset only ───────────────────────────────────
+clean_mask = ~rule_mask
+df_clean   = df[clean_mask].copy()
+X_clean    = df_clean[FEATURES].values
 
-# --- MAIN DASHBOARD DISPLAY ---
+kmeans_sil = kmeans_db = dbscan_sil = dbscan_db = iso_sil = iso_db = "N/A"
+dbscan_count = iso_count = 0
+
+if len(df_clean) > 1:
+    scaler  = StandardScaler()
+    X_scaled = scaler.fit_transform(X_clean)
+
+    # KMeans
+    kmeans = KMeans(n_clusters=n_clusters, init='k-means++', random_state=42, n_init=10)
+    km_labels = kmeans.fit_predict(X_scaled)
+    df_clean['kmeans_cluster'] = km_labels
+    if len(set(km_labels)) > 1:
+        kmeans_sil = f"{silhouette_score(X_scaled, km_labels):.4f}"
+        kmeans_db  = f"{davies_bouldin_score(X_scaled, km_labels):.4f}"
+
+    # DBSCAN
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+    db_labels = dbscan.fit_predict(X_scaled)
+    df_clean['dbscan_label'] = db_labels
+    db_out = db_labels == -1
+    dbscan_count = int(db_out.sum())
+    df_clean.loc[db_out, 'hybrid_cluster']   = -1
+    df_clean.loc[db_out, 'detection_source'] = 'dbscan'
+    df_clean.loc[db_out, 'outlier_reason']  += 'Density Outlier (DBSCAN) | '
+    unique_db = set(db_labels)
+    if len(unique_db - {-1}) >= 1 and len(unique_db) > 1:
+        dbscan_sil = f"{silhouette_score(X_scaled, db_labels):.4f}"
+        dbscan_db  = f"{davies_bouldin_score(X_scaled, db_labels):.4f}"
+
+    # Isolation Forest — run on all clean users; flag only those NOT already caught by DBSCAN
+    iso = IsolationForest(contamination=contamination, random_state=42)
+    iso_labels = iso.fit_predict(X_scaled)
+    df_clean['iso_label'] = iso_labels
+    iso_out = iso_labels == -1
+    iso_count = int(iso_out.sum())
+    iso_only  = iso_out & ~db_out
+    consensus  = iso_out & db_out
+    df_clean.loc[iso_only,  'hybrid_cluster']   = -1
+    df_clean.loc[iso_only,  'detection_source'] = 'iso'
+    df_clean.loc[iso_only,  'outlier_reason']  += 'Statistical Outlier (Isolation Forest) | '
+    df_clean.loc[consensus, 'detection_source'] = 'consensus'
+    if len(set(iso_labels)) > 1:
+        iso_sil = f"{silhouette_score(X_scaled, iso_labels):.4f}"
+        iso_db  = f"{davies_bouldin_score(X_scaled, iso_labels):.4f}"
+
+    # PCA for visualisation
+    pca = PCA(n_components=2)
+    pca_coords = pca.fit_transform(X_scaled)
+    df_clean['pca_1'] = pca_coords[:, 0]
+    df_clean['pca_2'] = pca_coords[:, 1]
+
+    # Write results back to main df
+    for col in ['kmeans_cluster', 'dbscan_label', 'iso_label', 'hybrid_cluster', 'detection_source', 'outlier_reason', 'pca_1', 'pca_2']:
+        if col in df_clean.columns:
+            df.loc[clean_mask, col] = df_clean[col].values
+
+# Clean up trailing separators
+df['outlier_reason'] = df['outlier_reason'].str.strip(' |').str.strip()
+df['is_bot_label']   = df['hybrid_cluster'].apply(lambda x: 'Bot/Anomaly' if x == -1 else 'Normal User')
+
+# Fill pca for rule-flagged (they were excluded from PCA, place at extreme)
+if 'pca_1' not in df.columns:
+    df['pca_1'] = 0.0
+    df['pca_2'] = 0.0
+df['pca_1'] = df['pca_1'].fillna(df['pca_1'].max() + 2 if df['pca_1'].notna().any() else 5.0)
+df['pca_2'] = df['pca_2'].fillna(df['pca_2'].max() + 2 if df['pca_2'].notna().any() else 5.0)
+
+# ─── METRICS SUMMARY ─────────────────────────────────────────────────────────
+total_users   = len(df)
+rule_flagged  = int(rule_mask.sum())
+ml_flagged    = int((df['hybrid_cluster'] == -1).sum()) - rule_flagged
+total_bots    = int((df['hybrid_cluster'] == -1).sum())
+bot_ratio     = (total_bots / total_users) * 100
+
+# ─── MAIN UI ─────────────────────────────────────────────────────────────────
 st.title("🛡️ Real-Time Social Bot Detection Dashboard")
-st.markdown("Hệ thống phân tích hành vi bất thường chạy trực tiếp thuật toán học máy.")
+st.markdown("Hệ thống **Hybrid Detection**: Kết hợp Rule-Based heuristics và Machine Learning để phát hiện bot với độ chính xác cao nhất.")
 
-tab1, tab2, tab3 = st.tabs([
-    "📈 Dashboard & Analytics", 
-    "🗂️ Database & Blacklist", 
-    "🔍 Account Lookup (XAI)"
-])
+tab1, tab2, tab3 = st.tabs(["📈 Dashboard & Analytics", "🗂️ Database & Blacklist", "🔍 Account Lookup (XAI)"])
 
-# ==========================================
-# TAB 1: DASHBOARD & ANALYTICS
-# ==========================================
+# ═══ TAB 1 ═══════════════════════════════════════════════════════════════════
 with tab1:
-    st.header("Thống kê Tổng quan (Thời Gian Thực)")
-    
-    total_users = len(df_raw)
-    bot_ratio = (dbscan_outliers / total_users) * 100 if total_users > 0 else 0
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Tổng Tài Khoản", total_users)
-    with col2:
-        st.metric("Bot Phát Hiện (DBSCAN)", dbscan_outliers, delta=f"{bot_ratio:.1f}%", delta_color="inverse")
-    with col3:
-        st.metric("Outliers (Isolation Forest)", iso_outliers)
-    with col4:
-        st.metric("K-Means Clusters", n_clusters)
-        
-    st.markdown("---")
-    
-    # 2D Behavior Scatter Plot using dynamic PCA
-    st.subheader("2D Behavior Projection Plot (Dynamic PCA)")
-    st.markdown("Biểu đồ chiếu dữ liệu đa chiều xuống không gian 2 chiều bằng giải thuật PCA để phân tích trực quan ranh giới quyết định.")
-    
-    scatter_chart = alt.Chart(df_raw).mark_circle(size=60).encode(
-        x=alt.X('pca_1', title='PCA 1 (Behavior Trend)'),
-        y=alt.Y('pca_2', title='PCA 2 (Posting Activity)'),
-        color=alt.Color('is_bot', scale=alt.Scale(domain=['Normal User', 'Bot/Anomaly'], range=['#00cc96', '#ff4b4b']), title='Label (DBSCAN)'),
-        tooltip=['username', 'follow_ratio', 'avg_time_diff_minutes', 'engagement_rate', 'night_post_ratio', 'lexical_diversity']
-    ).interactive().properties(height=450)
-    
-    st.altair_chart(scatter_chart, use_container_width=True)
+    st.header("Thống kê Tổng quan")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Tổng Tài Khoản", total_users)
+    c2.metric("Rule-Based Flagged", rule_flagged)
+    c3.metric("ML Flagged (thêm)", ml_flagged)
+    c4.metric("Tổng Bot Phát Hiện", total_bots, delta=f"{bot_ratio:.1f}%", delta_color="inverse")
+    c5.metric("K-Means Clusters", n_clusters)
 
     st.markdown("---")
-    
-    # Advanced Performance Metrics Table
-    st.subheader("📊 Bảng So Sánh Hiệu Suất Mô Hình Thuật Toán")
-    
+    st.subheader("2D Behavior Projection (PCA)")
+    scatter = alt.Chart(df).mark_circle(size=55, opacity=0.75).encode(
+        x=alt.X('pca_1', title='PCA 1 (Behavior Trend)'),
+        y=alt.Y('pca_2', title='PCA 2 (Activity Pattern)'),
+        color=alt.Color('is_bot_label',
+                        scale=alt.Scale(domain=['Normal User', 'Bot/Anomaly'],
+                                        range=['#00cc96', '#ff4b4b']),
+                        title='Label'),
+        shape=alt.Shape('detection_source',
+                        scale=alt.Scale(domain=['', 'rule', 'dbscan', 'iso', 'consensus'],
+                                        range=['circle', 'triangle-up', 'square', 'diamond', 'cross']),
+                        title='Detection Source'),
+        tooltip=['username', 'follow_ratio', 'avg_time_diff_minutes',
+                 'engagement_rate', 'night_post_ratio', 'lexical_diversity',
+                 'detection_source', 'outlier_reason']
+    ).interactive().properties(height=460)
+    st.altair_chart(scatter, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("📊 Bảng So Sánh Hiệu Suất Mô Hình (trên tập dữ liệu sạch)")
     metrics_df = pd.DataFrame({
-        "Model": [f"K-Means (K={n_clusters})", f"DBSCAN (eps={eps}, min_samples={min_samples})", f"Isolation Forest (cont={contamination:.2f})"],
-        "Outliers Detected": ["N/A", dbscan_outliers, iso_outliers],
-        "Silhouette Score": [kmeans_sil, dbscan_sil, iso_sil],
-        "Davies-Bouldin Index": [kmeans_db, dbscan_db, iso_db]
+        "Model": [f"K-Means (K={n_clusters})",
+                  f"DBSCAN (eps={eps}, min_samples={min_samples})",
+                  f"Isolation Forest (contamination={contamination:.2f})"],
+        "Outliers Detected": ["N/A", dbscan_count, iso_count],
+        "Silhouette Score ↑":  [kmeans_sil, dbscan_sil, iso_sil],
+        "Davies-Bouldin Index ↓": [kmeans_db, dbscan_db, iso_db],
     })
-    
     st.table(metrics_df)
-    
     st.markdown("""
-    ### 💡 Giải thích các Chỉ số Đo lường Hiệu năng Cụm (Clustering Metrics Explained)
-    
-    * **Silhouette Score (Hệ số Dáng hình):**
-      * Có giá trị từ **-1 đến 1**.
-      * Giá trị **càng cao (gần 1)** thể hiện các cụm được phân tách rõ ràng, các điểm trong cụm rất gần nhau và cách biệt hẳn các cụm khác.
-      * Hệ số âm hoặc gần 0 nghĩa là các cụm bị chồng lấn đáng kể hoặc các điểm bị gán sai cụm.
-    
-    * **Davies-Bouldin Index (Chỉ số Davies-Bouldin):**
-      * Có giá trị tối thiểu là **0**.
-      * Giá trị **càng thấp** thể hiện hiệu năng gom cụm tốt hơn (cụm chặt chẽ bên trong và xa nhau bên ngoài).
-      * Phản ánh tỷ số giữa khoảng cách nội cụm và khoảng cách liên cụm.
+    **💡 Giải thích chỉ số:**
+    - **Silhouette Score** (↑ tốt hơn, từ -1→1): Đo mức độ phân tách rõ ràng giữa các cụm. Giá trị càng cao (gần 1) nghĩa là các cụm càng tách biệt và nội bộ càng chặt chẽ.
+    - **Davies-Bouldin Index** (↓ tốt hơn, ≥ 0): Đo tỷ lệ giữa khoảng cách nội cụm và khoảng cách liên cụm. Giá trị càng thấp nghĩa là cụm càng chặt và xa nhau hơn.
     """)
 
-# ==========================================
-# TAB 2: DATABASE & BLACKLIST
-# ==========================================
+# ═══ TAB 2 ═══════════════════════════════════════════════════════════════════
 with tab2:
     st.header("Quản lý Dữ liệu")
-    
-    st.subheader("📁 Tất cả tài khoản đã quét (All Scanned Users)")
-    st.dataframe(df_raw, use_container_width=True, height=300)
-    
+
+    st.subheader("📁 Tất cả tài khoản (All Scanned Users)")
+    display_cols = ['username', 'follow_ratio', 'avg_time_diff_minutes', 'engagement_rate',
+                    'night_post_ratio', 'lexical_diversity', 'is_bot_declared', 'hybrid_cluster',
+                    'detection_source', 'outlier_reason']
+    available = [c for c in display_cols if c in df.columns]
+    st.dataframe(df[available], use_container_width=True, height=300)
+
     st.markdown("---")
-    st.subheader("☠️ Danh sách Đen (Detected Bots Blacklist)")
-    st.markdown("Bảng phân loại các tài khoản dị thường cùng với bằng chứng hành vi cụ thể.")
-    
-    # Filter anomalies from DBSCAN
-    blacklist_df = df_raw[df_raw['dbscan_cluster'] == -1].copy()
-    
-    # Function to generate dynamic evidence reasons based on raw thresholds
-    def get_outlier_reasons(row):
-        reasons = []
-        if row['night_post_ratio'] > 0.8:
-            reasons.append("High Night Activity (>80% đêm)")
-        if row['lexical_diversity'] < 0.2:
-            reasons.append("Repetitive Content/Vocabulary (Từ vựng <20% đa dạng)")
-        if row['follow_ratio'] > 15.0:
-            reasons.append("Spammy Following (Follows/Followers > 15)")
-        if row['avg_time_diff_minutes'] < 5.0:
-            reasons.append("Automation/Botting (Đăng bài <5 phút/lần)")
-        if row['engagement_rate'] == 0.0 and row['follow_ratio'] > 5.0:
-            reasons.append("Zero engagement with high following")
-            
-        if not reasons:
-            reasons.append("General Behavior Outlier (Hành vi dị biệt tổng thể)")
-            
-        return " | ".join(reasons)
+    st.subheader("☠️ Bot Blacklist (Hybrid: Rule + ML)")
+
+    blacklist_df = df[df['hybrid_cluster'] == -1].copy()
+    bl_cols = ['username', 'follow_ratio', 'avg_time_diff_minutes', 'engagement_rate',
+               'night_post_ratio', 'lexical_diversity', 'detection_source', 'outlier_reason']
+    bl_available = [c for c in bl_cols if c in blacklist_df.columns]
 
     if not blacklist_df.empty:
-        blacklist_df['Reason for Outlier Flag'] = blacklist_df.apply(get_outlier_reasons, axis=1)
-        
-        # Style and render
-        styled_blacklist = blacklist_df[['username', 'follow_ratio', 'avg_time_diff_minutes', 'engagement_rate', 'night_post_ratio', 'lexical_diversity', 'Reason for Outlier Flag']]
-        st.dataframe(styled_blacklist.style.set_properties(**{'background-color': '#2a0000', 'color': '#ff9999'}), use_container_width=True, height=300)
-        
-        # Download button
-        csv = styled_blacklist.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Tải xuống Blacklist (.CSV)",
-            data=csv,
-            file_name='bot_blacklist.csv',
-            mime='text/csv',
+        st.dataframe(
+            blacklist_df[bl_available].style.set_properties(**{'background-color': '#1a0000', 'color': '#ff9999'}),
+            use_container_width=True, height=320
         )
+        csv = blacklist_df[bl_available].to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Tải xuống Blacklist (.CSV)", data=csv,
+                           file_name='bot_blacklist.csv', mime='text/csv')
     else:
-        st.success("✅ Tuyệt vời! Không phát hiện tài khoản bot nào với cấu hình DBSCAN hiện tại.")
+        st.success("✅ Không phát hiện tài khoản bot nào với cấu hình hiện tại.")
 
-# ==========================================
-# TAB 3: ACCOUNT LOOKUP (XAI)
-# ==========================================
+# ═══ TAB 3 ═══════════════════════════════════════════════════════════════════
 with tab3:
     st.header("Tra cứu & Explainable AI (XAI)")
-    search_username = st.text_input("Nhập Username cần kiểm tra (Ví dụ: copy 1 tên bên Tab 2 bỏ vào đây):")
-    
-    if search_username:
-        user_data = df_raw[df_raw['username'] == search_username]
-        
-        if user_data.empty:
+    search = st.text_input("Nhập Username cần kiểm tra:")
+
+    if search:
+        row = df[df['username'] == search]
+        if row.empty:
             st.warning("Không tìm thấy tài khoản này trong cơ sở dữ liệu!")
         else:
-            user_data = user_data.iloc[0]
-            is_bot = user_data['dbscan_cluster'] == -1
-            
+            row = row.iloc[0]
+            is_bot = row['hybrid_cluster'] == -1
             if is_bot:
-                st.error(f"🚨 CẢNH BÁO: '{search_username}' bị đánh dấu là Bot/Spam.")
+                st.error(f"🚨 CẢNH BÁO: '{search}' bị đánh dấu Bot/Spam.")
+                st.info(f"**Lý do:** {row.get('outlier_reason', 'N/A')}  |  **Nguồn phát hiện:** `{row.get('detection_source', 'N/A')}`")
             else:
-                st.success(f"✅ AN TOÀN: '{search_username}' có hành vi sinh hoạt bình thường.")
-            
-            st.subheader("Giải thích Quyết định thuật toán")
-            
-            normal_users = df_raw[df_raw['dbscan_cluster'] != -1]
-            normal_avg = normal_users[['follow_ratio', 'avg_time_diff_minutes', 'engagement_rate', 'night_post_ratio', 'lexical_diversity']].mean()
-            user_stats = user_data[['follow_ratio', 'avg_time_diff_minutes', 'engagement_rate', 'night_post_ratio', 'lexical_diversity']]
-            
+                st.success(f"✅ AN TOÀN: '{search}' có hành vi sinh hoạt bình thường.")
+
+            st.subheader("Giải thích Quyết định (XAI)")
+            normal = df[df['hybrid_cluster'] != -1]
+            avg_normal = normal[FEATURES].mean()
+            user_vals  = row[FEATURES]
+
             chart_data = pd.DataFrame({
-                'Người thật (Trung bình)': normal_avg.values,
-                f'Hành vi của {search_username}': user_stats.values
-            }, index=['Tỷ lệ Follow', 'Khoảng cách Bài đăng', 'Tương tác TB', 'Hoạt động Đêm', 'Độ đa dạng từ vựng'])
-            
+                'Người thật (Trung bình)': avg_normal.values,
+                f'Hành vi của {search}': user_vals.values
+            }, index=['Follow Ratio', 'Avg Time Diff (min)', 'Engagement Rate', 'Night Post Ratio', 'Lexical Diversity'])
             st.bar_chart(chart_data)
-            st.info("Biểu đồ so sánh hành vi (unscaled) của tài khoản được tra cứu so với hành vi trung bình của nhóm người dùng bình thường.")
+            st.info("So sánh hành vi của tài khoản được tra cứu so với giá trị trung bình của nhóm người dùng bình thường (raw features, không chuẩn hóa).")
