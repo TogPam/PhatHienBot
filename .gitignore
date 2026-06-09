@@ -21,3 +21,6 @@ Thumbs.db
 # --- Logs và Báo cáo ---
 *.log
 docs/*.png
+
+# --- Data ---
+data/
