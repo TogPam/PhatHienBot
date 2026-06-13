@@ -1,17 +1,155 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import altair as alt
 import os
 import json
 import re
+import tempfile
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.decomposition import PCA
+from transformers import pipeline as hf_pipeline
+from pyvis.network import Network
 
 st.set_page_config(page_title="Social Bot Detector Dashboard", page_icon="🛡️", layout="wide", initial_sidebar_state="expanded")
+
+# ─── NLP MODEL (cached, loaded once per session) ────────────────────────────
+@st.cache_resource(show_spinner="⏳ Loading NLP model (first time only)...")
+def load_nlp_classifier():
+    return hf_pipeline(
+        "zero-shot-classification",
+        model="valhalla/distilbart-mnli-12-3",
+        device=-1           # CPU; change to 0 for GPU
+    )
+
+@st.cache_data
+def get_user_posts(json_path: str, username: str) -> list[str]:
+    """Return a list of clean post texts for a given username."""
+    if not os.path.exists(json_path):
+        return []
+    with open(json_path, 'r', encoding='utf-8') as f:
+        raw_users = json.load(f)
+    for user in raw_users:
+        if user['username'] == username:
+            texts = []
+            for post in user.get('posts', []):
+                content = post.get('content', '').strip()
+                if content:
+                    texts.append(content)
+            return texts
+    return []
+
+@st.cache_data
+def get_hashtags_map(json_path: str) -> dict[str, set]:
+    """Return {username: set_of_hashtags} extracted from raw posts."""
+    if not os.path.exists(json_path):
+        return {}
+    with open(json_path, 'r', encoding='utf-8') as f:
+        raw_users = json.load(f)
+    result = {}
+    for user in raw_users:
+        tags = set()
+        for post in user.get('posts', []):
+            content = post.get('content', '')
+            tags.update(t.lower() for t in re.findall(r'#(\w+)', content))
+        result[user['username']] = tags
+    return result
+
+@st.cache_data
+def build_network_graph_html(
+    usernames: list,
+    hybrid_labels: list,
+    detection_sources: list,
+    outlier_reasons: list,
+    feature_matrix: np.ndarray,    # shape (N, F) — unscaled features
+    hashtag_map: dict,
+    dist_threshold: float = 0.10,
+    min_shared_tags: int = 3,
+) -> str:
+    """Build a pyvis network and return the generated HTML string."""
+    net = Network(
+        height="620px",
+        width="100%",
+        bgcolor="#000000",
+        font_color="#ffffff",
+        directed=False,
+    )
+    net.barnes_hut(
+        gravity=-12000,
+        central_gravity=0.3,
+        spring_length=120,
+        spring_strength=0.05,
+        damping=0.09,
+        overlap=0,
+    )
+
+    # Add nodes
+    for i, (uname, label, src, reason) in enumerate(
+        zip(usernames, hybrid_labels, detection_sources, outlier_reasons)
+    ):
+        is_bot = label == -1
+        color  = "#ff4b4b" if is_bot else "#00cc96"
+        size   = 18 if is_bot else 10
+        title  = (
+            f"<b>{uname}</b><br>"
+            f"Status: {'🚨 BOT' if is_bot else '✅ Normal'}<br>"
+            f"Source: {src or 'N/A'}<br>"
+            f"Reason: {reason or 'N/A'}"
+        )
+        net.add_node(
+            uname,
+            label=uname,
+            color=color,
+            size=size,
+            title=title,
+            borderWidth=2 if is_bot else 1,
+        )
+
+    N = len(usernames)
+
+    # Normalise feature matrix for distance computation
+    feat_std = feature_matrix.std(axis=0)
+    feat_std[feat_std == 0] = 1.0
+    X_norm = (feature_matrix - feature_matrix.mean(axis=0)) / feat_std
+
+    # Add edges — limit to avoid O(N^2) explosion on 500 nodes
+    edge_count = 0
+    MAX_EDGES = 1500
+    for i in range(N):
+        if edge_count >= MAX_EDGES:
+            break
+        for j in range(i + 1, N):
+            if edge_count >= MAX_EDGES:
+                break
+            a, b = usernames[i], usernames[j]
+
+            # Criterion 1: very close in feature space
+            dist = float(np.linalg.norm(X_norm[i] - X_norm[j]))
+            if dist < dist_threshold:
+                net.add_edge(a, b, color="#334455", width=1,
+                             title=f"Behavioral distance: {dist:.4f}")
+                edge_count += 1
+                continue
+
+            # Criterion 2: many shared hashtags
+            shared = hashtag_map.get(a, set()) & hashtag_map.get(b, set())
+            if len(shared) > min_shared_tags:
+                net.add_edge(a, b, color="#9933cc", width=2,
+                             title=f"Shared hashtags: {', '.join(list(shared)[:6])}")
+                edge_count += 1
+
+    # Generate HTML to a temp file then read back
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode='w', encoding='utf-8') as tmp:
+        net.save_graph(tmp.name)
+        tmp_path = tmp.name
+    with open(tmp_path, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+    os.unlink(tmp_path)
+    return html_content
 
 # ─── DATA LOADING ────────────────────────────────────────────────────────────
 @st.cache_data
@@ -199,7 +337,12 @@ bot_ratio     = (total_bots / total_users) * 100
 st.title("🛡️ Real-Time Social Bot Detection Dashboard")
 st.markdown("Hệ thống **Hybrid Detection**: Kết hợp Rule-Based heuristics và Machine Learning để phát hiện bot với độ chính xác cao nhất.")
 
-tab1, tab2, tab3 = st.tabs(["📈 Dashboard & Analytics", "🗂️ Database & Blacklist", "🔍 Account Lookup (XAI)"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📈 Dashboard & Analytics",
+    "🗂️ Database & Blacklist",
+    "🔍 Account Lookup (XAI)",
+    "🕸️ Botnet Network Graph",
+])
 
 # ═══ TAB 1 ═══════════════════════════════════════════════════════════════════
 with tab1:
@@ -278,9 +421,13 @@ with tab2:
         st.success("✅ Không phát hiện tài khoản bot nào với cấu hình hiện tại.")
 
 # ═══ TAB 3 ═══════════════════════════════════════════════════════════════════
+NLP_LABELS     = ["Crypto Scam", "Hate Speech", "NSFW", "Normal Conversation"]
+RISK_LABELS    = {"Crypto Scam", "Hate Speech", "NSFW"}
+RISK_THRESHOLD = 0.70
+
 with tab3:
     st.header("Tra cứu & Explainable AI (XAI)")
-    search = st.text_input("Nhập Username cần kiểm tra:")
+    search = st.text_input("Nhập Username cần kiểm tra:", key="xai_search")
 
     if search:
         row = df[df['username'] == search]
@@ -295,14 +442,112 @@ with tab3:
             else:
                 st.success(f"✅ AN TOÀN: '{search}' có hành vi sinh hoạt bình thường.")
 
-            st.subheader("Giải thích Quyết định (XAI)")
-            normal = df[df['hybrid_cluster'] != -1]
+            # ── Behavior XAI Chart ──────────────────────────────────────────
+            st.subheader("Giải thích Quyết định Hành vi (Behavioral XAI)")
+            normal    = df[df['hybrid_cluster'] != -1]
             avg_normal = normal[FEATURES].mean()
             user_vals  = row[FEATURES]
-
             chart_data = pd.DataFrame({
                 'Người thật (Trung bình)': avg_normal.values,
                 f'Hành vi của {search}': user_vals.values
             }, index=['Follow Ratio', 'Avg Time Diff (min)', 'Engagement Rate', 'Night Post Ratio', 'Lexical Diversity'])
             st.bar_chart(chart_data)
             st.info("So sánh hành vi của tài khoản được tra cứu so với giá trị trung bình của nhóm người dùng bình thường (raw features, không chuẩn hóa).")
+
+            # ── Deep NLP Content Scanner ────────────────────────────────────
+            st.markdown("---")
+            st.subheader("🧠 Deep NLP Content Scanner")
+            st.markdown("Phân tích nội dung bài đăng thực tế bằng mô hình **Zero-Shot Classification (DistilBART-MNLI)**.")
+
+            if st.button("🔍 Scan Content for Toxicity & Scams", type="primary", key="nlp_scan_btn"):
+                posts = get_user_posts(JSON_PATH, search)
+
+                if not posts:
+                    st.warning("Không tìm thấy bài đăng nào cho tài khoản này trong dữ liệu thô.")
+                else:
+                    # Concatenate up to 5 most recent posts for context
+                    sample_posts = posts[:5]
+                    combined_text = " ".join(sample_posts)[:1500]  # truncate to keep inference fast
+
+                    with st.spinner("🤖 Đang phân tích nội dung bằng mô hình NLP..."):
+                        classifier = load_nlp_classifier()
+                        result = classifier(
+                            combined_text,
+                            candidate_labels=NLP_LABELS,
+                            multi_label=False
+                        )
+
+                    # Build score dict
+                    scores = dict(zip(result['labels'], result['scores']))
+
+                    # ── High-risk banners ──────────────────────────────────
+                    any_high_risk = False
+                    for label in NLP_LABELS:
+                        if label in RISK_LABELS and scores.get(label, 0) >= RISK_THRESHOLD:
+                            pct = scores[label] * 100
+                            st.error(f"⚠️ HIGH RISK: {pct:.1f}% probability of **{label}** detected in content!")
+                            any_high_risk = True
+
+                    if not any_high_risk:
+                        st.success("✅ Nội dung không phát hiện rủi ro cao (< 70% trên bất kỳ nhãn độc hại nào).")
+
+                    # ── Score progress bars ────────────────────────────────
+                    st.markdown("**Điểm phân loại chi tiết (Zero-Shot NLP):**")
+                    label_colors = {
+                        "Crypto Scam":       "🟠",
+                        "Hate Speech":       "🔴",
+                        "NSFW":              "🟣",
+                        "Normal Conversation": "🟢",
+                    }
+                    for label in NLP_LABELS:
+                        score = scores.get(label, 0.0)
+                        icon  = label_colors.get(label, "⚪")
+                        col_label, col_bar, col_pct = st.columns([2, 5, 1])
+                        with col_label:
+                            st.markdown(f"{icon} **{label}**")
+                        with col_bar:
+                            st.progress(float(score))
+                        with col_pct:
+                            st.markdown(f"`{score*100:.1f}%`")
+
+                    # ── Sampled posts preview ──────────────────────────────
+                    with st.expander(f"📄 Xem {len(sample_posts)} bài đăng được phân tích"):
+                        for i, post in enumerate(sample_posts, 1):
+                            st.markdown(f"**Post {i}:** {post[:300]}{'...' if len(post) > 300 else ''}")
+                            st.markdown("---")
+
+# ═══ TAB 4: BOTNET NETWORK GRAPH ═════════════════════════════════════════════
+with tab4:
+    st.header("🕸️ Botnet Network Graph")
+    st.markdown(
+        "Đồ thị mạng lưới tương tác giữa **500 tài khoản**. "
+        "**Đỏ** = Bot/Anomaly, **Xanh** = Normal User. "
+        "Cạnh **xanh đậm** = khoảng cách hành vi gần (< 0.1), "
+        "cạnh **tím** = cùng hashtag (> 3 tags chung). "
+        "Kéo thả, zoom để khám phá."
+    )
+
+    with st.spinner("⚙️ Đang xây dựng đồ thị mạng… (lần đầu có thể mất vài giây)"):
+        hashtag_map = get_hashtags_map(JSON_PATH)
+
+        graph_html = build_network_graph_html(
+            usernames        = df['username'].tolist(),
+            hybrid_labels    = df['hybrid_cluster'].tolist(),
+            detection_sources= df['detection_source'].tolist(),
+            outlier_reasons  = df['outlier_reason'].tolist(),
+            feature_matrix   = df[FEATURES].values,
+            hashtag_map      = hashtag_map,
+            dist_threshold   = 0.10,
+            min_shared_tags  = 2,
+        )
+
+    components.html(graph_html, height=640, scrolling=False)
+
+    st.markdown("---")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.markdown("**Chú thích màu sắc:**")
+        st.markdown("🔴 Bot / Anomaly&nbsp;&nbsp;&nbsp;🟢 Normal User")
+    with col_r:
+        st.markdown("**Chú thích cạnh:**")
+        st.markdown("🔵 Behavioral proximity (dist < 0.10)&nbsp;&nbsp;&nbsp;🟣 Shared hashtags (> 2 tags)")
