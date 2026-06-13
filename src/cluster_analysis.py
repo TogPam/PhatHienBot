@@ -56,5 +56,42 @@ def analyze_clusters():
     print(f"-> 2. ỨNG DỤNG THỰC TẾ: Đã xuất danh sách {len(blacklist_df)} tài khoản ảo ra file 'data/bot_blacklist.csv'.")
     print("      (Doanh nghiệp có thể upload file này lên Facebook/Google Ads để chặn hiển thị quảng cáo).")
 
+    # 5. ĐỒNG BỘ DỮ LIỆU LÊN DATABASE WEB (MYSQL)
+    print("\n-> 3. Đang đồng bộ danh sách BOT lên Database Web (MySQL)...")
+    try:
+        import mysql.connector
+        
+        # Kết nối tới database
+        db = mysql.connector.connect(
+            host="localhost",
+            user="root",        # Tên đăng nhập mặc định của MySQL/XAMPP
+            password="",        # Mật khẩu (thường XAMPP để trống)
+            database="mxh_db"
+        )
+        cursor = db.cursor()
+        
+        # Bước 1: Reset toàn bộ user về trạng thái bình thường (bot = 0) trước khi cập nhật
+        cursor.execute("UPDATE users SET bot = 0")
+        
+        # Bước 2: Cập nhật bot = 1 cho các tài khoản nằm trong Blacklist (Dựa vào username)
+        bot_usernames = blacklist_df['username'].dropna().tolist()
+        
+        if bot_usernames:
+            # Tạo chuỗi tham số %s,%s,%s... tương ứng với số lượng bot
+            format_strings = ','.join(['%s'] * len(bot_usernames))
+            update_query = f"UPDATE users SET bot = 1 WHERE username IN ({format_strings})"
+            
+            # Thực thi câu lệnh
+            cursor.execute(update_query, tuple(bot_usernames))
+            
+        db.commit() # Lưu thay đổi vào CSDL
+        print(f"      Đã gắn nhãn 'BOT ACCOUNT' cho {cursor.rowcount} tài khoản thành công! Tải lại web để xem kết quả.")
+        
+        cursor.close()
+        db.close()
+    except Exception as e:
+        print("      [!] Lỗi khi đồng bộ MySQL. Hãy đảm bảo MySQL đang chạy và đã cài: pip install mysql-connector-python")
+        print("      Chi tiết lỗi:", e)
+
 if __name__ == '__main__':
     analyze_clusters()
